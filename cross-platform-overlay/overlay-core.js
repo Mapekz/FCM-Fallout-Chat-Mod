@@ -478,10 +478,14 @@ function isUnknownForegroundClass(name) {
 }
 
 // Ordered list of active-window tools to probe for, based on session type.
-// KDE-Wayland: kdotool first (KWin D-Bus, sees native-Wayland windows too;
-// no libxdo crash), xdotool as fallback. X11 (any WM): xdotool first (the
-// native X11 tool), kdotool as a fallback in case it happens to work.
-function preferredForegroundTools({ kdeWayland, x11 }) {
+// Hyprland: hyprctl only (native compositor IPC; class + monitor in one JSON
+// call). Checked first because Hyprland is also Wayland and must not fall
+// through to a kdeWayland/x11 branch. KDE-Wayland: kdotool first (KWin D-Bus,
+// sees native-Wayland windows too; no libxdo crash), xdotool as fallback.
+// X11 (any WM): xdotool first (the native X11 tool), kdotool as a fallback
+// in case it happens to work.
+function preferredForegroundTools({ hyprland, kdeWayland, x11 }) {
+  if (hyprland) return ['hyprctl'];
   if (kdeWayland) return ['kdotool', 'xdotool'];
   if (x11) return ['xdotool', 'kdotool'];
   return [];
@@ -746,6 +750,72 @@ function awkStripFcmSectionLines() {
 // `sameOutput` must be explicitly false to block. An unresolved probe fails open.
 function shouldInstallKeepAboveRule({ gameRunning, sameOutput = true } = {}) {
   return !!gameRunning && sameOutput !== false;
+}
+
+// The subprocess argv for the active-window probe, per tool. hyprctl returns
+// JSON (parsed by parseForegroundOutput below); kdotool/xdotool print a bare
+// class string via the chained subcommand syntax.
+function buildForegroundProbe(tool) {
+  if (tool === 'hyprctl') return { cmd: 'hyprctl', args: ['activewindow', '-j'] };
+  return { cmd: tool, args: ['getactivewindow', 'getwindowclassname'] };
+}
+
+// Extracts the lowercased window class from a foreground-probe's stdout.
+// hyprctl prints JSON ({ class: "..." } or null when nothing is focused,
+// e.g. all windows minimized); kdotool/xdotool print the bare class (or
+// nothing on a clean "no active window" exit). Never throws — malformed
+// JSON or unexpected output is treated as "no active window" (empty string),
+// matching the existing kdotool/xdotool empty-output convention.
+function parseForegroundOutput(tool, stdout) {
+  const s = String(stdout || '').trim();
+  if (tool === 'hyprctl') {
+    if (!s) return '';
+    try {
+      const parsed = JSON.parse(s);
+      return String((parsed && parsed.class) || '').toLowerCase();
+    } catch {
+      return '';
+    }
+  }
+  return s.toLowerCase();
+}
+
+// Locates FO76 in `hyprctl clients -j` output by matching its class against
+// the given case-insensitive regex patterns (join GAME_PROCESSES + the
+// steam_app id the same way probeGameDisplay's kdotool/xdotool path does).
+// Returns the window's { x, y } position (from its "at" field) or null if
+// not found / malformed JSON. Pure — no subprocess, just JSON parsing, so
+// it's unit-testable without hyprctl installed.
+function parseHyprctlClientsForGame(jsonText, classPattern) {
+  let clients;
+  try {
+    clients = JSON.parse(String(jsonText || ''));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(clients)) return null;
+  const re = new RegExp(classPattern, 'i');
+  const match = clients.find((c) => c && typeof c.class === 'string' && re.test(c.class));
+  if (!match || !Array.isArray(match.at) || match.at.length < 2) return null;
+  return { x: match.at[0], y: match.at[1] };
+}
+
+// Same JSON shape as parseHyprctlClientsForGame, but returns the matched
+// client's `address` string (Hyprland window handle) so the pin dispatch
+// can target the overlay (`hyprctl dispatch pin address:<addr>`). Pin
+// toggles: calling it while already pinned un-pins. Never throws.
+function parseHyprctlClientsForAddress(jsonText, classPattern) {
+  let clients;
+  try {
+    clients = JSON.parse(String(jsonText || ''));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(clients)) return null;
+  const re = new RegExp(classPattern, 'i');
+  const match = clients.find((c) => c && typeof c.class === 'string' && re.test(c.class));
+  if (!match || typeof match.address !== 'string' || !match.address) return null;
+  return match.address;
 }
 
 // Install (clean + apply) script. Removes any stale FCM rules, then writes the current
@@ -1038,6 +1108,10 @@ module.exports = {
   isOverlayClass,
   isUnknownForegroundClass,
   preferredForegroundTools,
+  buildForegroundProbe,
+  parseForegroundOutput,
+  parseHyprctlClientsForGame,
+  parseHyprctlClientsForAddress,
   shouldRegisterShortcuts,
   decideForegroundPollerAction,
   nextPollerBackoffMs,
